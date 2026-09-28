@@ -28,6 +28,10 @@ const MAX_REGION_LEN: u32 = 128;
 const MAX_STRING_LEN: u32 = 64;
 const MAX_IPFS_HASHES: u32 = 10;
 const MAX_BATCH_SIZE: u32 = 20;
+
+/// Bump applied to the admin key on every privileged call, so the admin address
+/// cannot lapse out of persistent storage while a contract is still in use.
+const ADMIN_BUMP_LEDGERS: u32 = 100_000;
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[contract]

@@ -15,6 +15,10 @@ const INSTANCE_TTL_MAX: u32 = 500;
 const PERSISTENT_TTL_MIN: u32 = 500;
 const PERSISTENT_TTL_MAX: u32 = 2000;
 
+/// Bump applied to the admin key on every privileged call, so the admin address
+/// cannot lapse out of persistent storage while a contract is still in use.
+const ADMIN_BUMP_LEDGERS: u32 = 100_000;
+
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[contract]
@@ -36,16 +40,6 @@ impl ProgressContract {
         env.storage().persistent().extend_ttl(&DataKey::Admin, ADMIN_BUMP_LEDGERS, ADMIN_BUMP_LEDGERS);
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Paused, &false);
-        Ok(())
-    }
-
-    /// Store the verification contract address allowed to call `advance_level`.
-    /// When set, only that contract may authorize level advances (admin only).
-    pub fn set_verification_contract(env: Env, addr: Address) -> Result<(), ProgressError> {
-        Self::require_admin(&env)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::VerificationContract, &addr);
         Ok(())
     }
 
@@ -457,7 +451,6 @@ impl ProgressContract {
             .ok_or(ProgressError::NotInitialized)?;
         admin.require_auth();
         env.storage().persistent().extend_ttl(&DataKey::Admin, ADMIN_BUMP_LEDGERS, ADMIN_BUMP_LEDGERS);
-        Ok(())
         Ok(admin)
     }
 }
