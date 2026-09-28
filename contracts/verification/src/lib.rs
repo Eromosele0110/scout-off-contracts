@@ -786,7 +786,6 @@ mod tests {
     }
 
     #[test]
-    fn test_upgrade_preserves_admin() {
     fn test_pause_unpause_events() {
         let (env, client) = setup();
         let admin = Address::generate(&env);

@@ -121,6 +121,9 @@ impl ProgressContract {
     pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), ProgressError> {
         Self::require_admin(&env)?;
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
     /// Reset a player's level for dispute resolution.
     /// Existing history is preserved; a new history entry records the reset.
     pub fn reset_player_level(
@@ -882,4 +885,5 @@ mod tests {
         let result = client.try_advance_level(&validator, &player_id, &4u32);
         assert_eq!(result, Err(Ok(ProgressError::AlreadyAtMaxLevel)));
     }
+}
 }
