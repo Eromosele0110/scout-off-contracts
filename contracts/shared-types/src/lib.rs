@@ -22,6 +22,32 @@ pub struct ContractHealth {
     pub paused: bool,
 }
 
+/// Progress of a bounded, resumable storage migration.
+///
+/// A migration is reported rather than hidden: an operator has to be able to
+/// tell "not started" from "half done" from "finished", because `migrate` is
+/// expected to be called repeatedly until `complete` is true.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MigrationStatus {
+    /// Schema version the contract was on when this call started.
+    pub from: u32,
+    /// Schema version this call targeted.
+    pub to: u32,
+    /// Schema version compiled into the running WASM.
+    pub code: u32,
+    /// Schema version currently recorded in storage.
+    pub current: u32,
+    /// True while storage is still behind the code's layout.
+    pub pending: bool,
+    /// True once `current` has reached `code`.
+    pub complete: bool,
+    /// Highest id the cursor has already visited. `0` means "not started".
+    pub last_visited_id: u64,
+    /// Total items rewritten across all calls so far.
+    pub processed: u32,
+}
+
 impl ProgressLevel {
     /// Returns the next valid level, or None if already at the top.
     pub fn next(&self) -> Option<ProgressLevel> {

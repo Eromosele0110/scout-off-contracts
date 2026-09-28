@@ -22,4 +22,11 @@ pub enum ProgressError {
     Overflow = 8,
     /// Call to registration contract failed.
     RegistrationCallFailed = 9,
+    /// The stored schema version is newer than the version this build expects.
+    /// The contract was downgraded, and running a migration would corrupt state
+    /// written by a later layout. Refused rather than silently ignored.
+    SchemaVersionTooNew = 10,
+    /// `migrate` was called with a target version the contract does not know
+    /// how to reach.
+    UnknownSchemaTarget = 11,
 }

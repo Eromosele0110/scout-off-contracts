@@ -1,6 +1,17 @@
 use soroban_sdk::{contracttype, Address};
 
-pub use scoutchain_shared_types::{ContractHealth, ProgressLevel};
+pub use scoutchain_shared_types::{ContractHealth, MigrationStatus, ProgressLevel};
+
+/// Storage layout version this build of the contract expects.
+///
+/// Bump this only when the *layout* changes — a new `DataKey` variant, a changed
+/// field type, or a different meaning for an existing key. Adding a new
+/// entrypoint that writes keys of its own does not require a bump, because
+/// older readers ignore keys they do not know about.
+///
+/// The migration from 0 to 1 backfills [`DataKey::HistoryVec`] for players
+/// registered before that key existed.
+pub const CODE_SCHEMA_VERSION: u32 = 1;
 
 /// A single entry in the immutable progress history
 #[contracttype]
@@ -55,4 +66,16 @@ pub enum DataKey {
     /// The `Address` of the scout_access contract. Whitelisted as a secondary
     /// authorised caller of `advance_level` (for trial-offer Level-3 advances).
     ScoutAccessContract,
+    /// The storage layout version this contract is currently running. Absent
+    /// means version 0 — the pre-versioning layout — so a contract that has
+    /// never been migrated reads as "behind the code" rather than "current".
+    SchemaVersion,
+    /// How far a resumable migration has progressed. Stores the highest
+    /// `player_id` the cursor has already visited, so a second `migrate` call
+    /// resumes instead of re-scanning from zero. Absent means "not started".
+    MigrationCursor(u64),
+    /// Total items rewritten by a migration across all calls. Diagnostic only:
+    /// it lets an operator confirm progress across several `migrate` calls
+    /// without reading the cursor's implied position.
+    MigrationProcessed,
 }

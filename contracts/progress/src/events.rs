@@ -2,6 +2,13 @@
 use scoutchain_shared_types::ProgressLevel;
 use soroban_sdk::{Address, Env, Symbol};
 
+/// Emitted once, when a migration brings storage up to the version the running
+/// WASM expects. Absent this event, a contract is still on an older layout.
+pub fn schema_migrated(env: &Env, from: u32, to: u32) {
+    env.events()
+        .publish((Symbol::new(env, "schema_migrated"),), (from, to));
+}
+
 pub fn admin_transferred(env: &Env, old_admin: &Address, new_admin: &Address) {
     env.events().publish(
         (Symbol::new(env, "admin_transferred"),),

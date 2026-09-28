@@ -858,6 +858,54 @@ Return the contract's initialization and pause status.
 stellar contract invoke --id $PROGRESS_CONTRACT_ID -- health
 ```
 
+---
+
+#### `schema_version() -> u32`
+
+Return the storage layout version currently recorded in instance storage.
+Returns `0` when the key is absent, which is the pre-versioning layout: a
+contract that has never been migrated reads as behind the code rather than as
+current.
+
+`health()` is deliberately unchanged — `ContractHealth` is shared across all
+four contracts, so adding a field there would break every caller.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+```bash
+stellar contract invoke --id $PROGRESS_CONTRACT_ID -- schema_version
+```
+
+---
+
+#### `migrate(target_version: u32, max_items: u32) -> Result<MigrationStatus, ProgressError>`
+
+Migrate storage up to `target_version`, doing at most `max_items` units of work
+per call. Admin only. See [VERSIONING.md](VERSIONING.md) for the full
+procedure.
+
+`upgrade()` replaces the WASM immediately and Soroban gives a contract no hook
+that runs afterwards, so storage is still on the old layout when it returns.
+Call `migrate` in a loop until `complete` is true.
+
+| | |
+|---|---|
+| **Auth** | Admin must sign |
+| **Errors** | `NotInitialized` · `Unauthorized` · `SchemaVersionTooNew` · `UnknownSchemaTarget` |
+| **Returns** | `MigrationStatus { from, to, code, current, pending, complete, last_visited_id, processed }` |
+
+Calling it when storage is already at `target_version` is a no-op that reports
+`complete` and rewrites nothing, so a retried upgrade script is harmless. A
+target below the stored version is refused rather than rolled back, because
+downgrading a layout would discard data the current code expects.
+
+```bash
+stellar contract invoke --id $PROGRESS_CONTRACT_ID -- migrate -- 1 -- 100
+```
+
 ### Events
 
 | Event | Topics | Data | Description |
@@ -865,6 +913,7 @@ stellar contract invoke --id $PROGRESS_CONTRACT_ID -- health
 | `progress_updated` | event_name, updated_by (Address) | player_id (u64), old_level, new_level | Player advances one tier |
 | `player_level_reset` | event_name | player_id (u64), old_level, new_level | Admin resets a player's level |
 | `admin_transferred` | event_name | old_admin (Address), new_admin (Address) | Admin rights rotated |
+| `schema_migrated` | event_name | from (u32), to (u32) | Storage brought up to the running layout |
 
 ---
 
@@ -1440,6 +1489,9 @@ pub struct TrialOffer {
 | 6 | `AlreadyAtMaxLevel` | Player is already at `EliteTier` |
 | 7 | `PlayerNotFound` | History index out of range |
 | 8 | `Overflow` | History counter overflowed |
+| 9 | `RegistrationCallFailed` | Cross-contract call to registration failed |
+| 10 | `SchemaVersionTooNew` | `migrate` target below the stored version |
+| 11 | `UnknownSchemaTarget` | `migrate` target above the compiled layout version |
 
 ### `ScoutAccessError` (scout_access contract)
 

@@ -5,7 +5,9 @@ mod events;
 mod types;
 
 use errors::ProgressError;
-use types::{ContractHealth, DataKey, ProgressEntry, ProgressLevel};
+use types::{
+    CODE_SCHEMA_VERSION, ContractHealth, DataKey, MigrationStatus, ProgressEntry, ProgressLevel,
+};
 
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
 
@@ -40,6 +42,12 @@ impl ProgressContract {
         env.storage().persistent().extend_ttl(&DataKey::Admin, ADMIN_BUMP_LEDGERS, ADMIN_BUMP_LEDGERS);
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Paused, &false);
+        // A fresh contract is born on the current layout: there is no older
+        // state to migrate, so recording it here is what lets `migrate` be
+        // idempotent for a deployment that has never been upgraded.
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &CODE_SCHEMA_VERSION);
         Ok(())
     }
 
@@ -68,7 +76,7 @@ impl ProgressContract {
 
     /// Register the verification contract address so advance_level can
     /// authenticate callers (admin only). Must be called before any
-    /// advance_level call — without it, advance_level returns NotInitialized.
+    /// advance_level call â€” without it, advance_level returns NotInitialized.
     pub fn set_verification_contract(
         env: Env,
         addr: Address,
@@ -112,10 +120,80 @@ impl ProgressContract {
 
     /// Upgrade the contract WASM. Admin auth required.
     /// Persistent storage (including Admin) survives this call.
+    ///
+    /// The swap is deliberately not followed by a migration: Soroban gives a
+    /// contract no hook that runs after its own code is replaced, so storage
+    /// is still on the old layout when this returns. Call `migrate` afterwards
+    /// to bring it forward â€” see docs/VERSIONING.md.
     pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), ProgressError> {
         Self::require_admin(&env)?;
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
+    }
+
+    /// The storage layout version currently recorded in instance storage.
+    ///
+    /// Returns `0` when the key is absent, which is the pre-versioning layout:
+    /// a contract that has never been migrated reads as behind the code rather
+    /// than as current.
+    pub fn schema_version(env: Env) -> u32 {
+        Self::bump_instance_ttl(&env);
+        Self::read_schema_version(&env)
+    }
+
+    /// Migrate storage up to `target_version`, at most `max_items` per call.
+    ///
+    /// Bounded and resumable by design: a full history backfill can exceed what
+    /// one transaction can afford, so each call does a slice of the work and
+    /// records a cursor. Call it repeatedly until `complete` is true â€”
+    /// `scripts/upgrade.sh` drives exactly that loop and then verifies through
+    /// `schema_version`.
+    ///
+    /// Idempotent in both directions. Calling it when storage is already at
+    /// `target_version` reports `complete` and rewrites nothing, so a retried
+    /// upgrade script is harmless. Calling it with a target below the stored
+    /// version is refused rather than rolled back, because downgrading a layout
+    /// would discard data the current code expects.
+    pub fn migrate(
+        env: Env,
+        target_version: u32,
+        max_items: u32,
+    ) -> Result<MigrationStatus, ProgressError> {
+        Self::bump_instance_ttl(&env);
+        Self::require_admin(&env)?;
+
+        let from = Self::read_schema_version(&env);
+        if from > target_version {
+            return Err(ProgressError::SchemaVersionTooNew);
+        }
+        if target_version > CODE_SCHEMA_VERSION {
+            return Err(ProgressError::UnknownSchemaTarget);
+        }
+
+        if from == target_version {
+            // Nothing to do. Returning the current cursor keeps the response
+            // shape identical whether or not work happened, so a caller can
+            // loop on `complete` without special-casing the first call.
+            return Ok(Self::migration_status(&env, from, target_version));
+        }
+
+        // v0 -> v1: backfill `HistoryVec` for players registered before that
+        // key existed. `HistoryEntry(player, idx)` is already correct, so the
+        // migration is a copy rather than a recomputation.
+        if from < 1 && target_version >= 1 {
+            Self::backfill_history_vec(&env, max_items);
+        }
+
+        let current = target_version;
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &current);
+
+        if current >= 1 {
+            events::schema_migrated(&env, from, current);
+        }
+
+        Ok(Self::migration_status(&env, from, current))
     }
 
     /// Reset a player's level for dispute resolution.
@@ -178,7 +256,7 @@ impl ProgressContract {
         // Only the configured VerificationContract (or the optional secondary
         // ScoutAccessContract for trial-offer Level-3 advances) may call this
         // function.  If neither whitelist address is configured the call is
-        // rejected — there is no open fallback.
+        // rejected â€” there is no open fallback.
         let verification_contract: Address = env
             .storage()
             .instance()
@@ -431,6 +509,101 @@ impl ProgressContract {
         Ok(())
     }
 
+    /// Stored layout version, treating an absent key as the pre-versioning
+    /// layout rather than as an error.
+    fn read_schema_version(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::SchemaVersion)
+            .unwrap_or(0u32)
+    }
+
+    fn read_cursor(env: &Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::MigrationCursor(0))
+            .unwrap_or(0u64)
+    }
+
+    fn read_processed(env: &Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::MigrationProcessed)
+            .unwrap_or(0u32)
+    }
+
+    fn migration_status(env: &Env, from: u32, to: u32) -> MigrationStatus {
+        let current = Self::read_schema_version(env);
+        MigrationStatus {
+            from,
+            to,
+            code: CODE_SCHEMA_VERSION,
+            current,
+            pending: current < CODE_SCHEMA_VERSION,
+            complete: current >= CODE_SCHEMA_VERSION,
+            last_visited_id: Self::read_cursor(env),
+            processed: Self::read_processed(env),
+        }
+    }
+
+    /// Walk player ids from just past the cursor, handing each to `visit` until
+    /// `max_items` ids have been considered or `highest` is reached.
+    ///
+    /// The cursor advances for every id visited, including ones the visitor
+    /// skips, so a player with nothing to migrate is not reconsidered on the
+    /// next call. That is what makes repeated calls terminate.
+    fn backfill_history_vec(env: &Env, max_items: u32) {
+        // `max_items` of zero would make no progress while still advancing the
+        // stored version, which would silently mark the migration done. Treat
+        // it as a no-op instead, so the caller loops again.
+        if max_items == 0 {
+            return;
+        }
+
+        let mut cursor = Self::read_cursor(env);
+        let mut processed = Self::read_processed(env);
+
+        for _ in 0..max_items {
+            cursor = cursor.saturating_add(1);
+
+            let counter_key = DataKey::HistoryCounter(cursor);
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&counter_key)
+                .unwrap_or(0u32);
+            let vec_key = DataKey::HistoryVec(cursor);
+
+            if count > 0 && !env.storage().persistent().has(&vec_key) {
+                let mut history: Vec<ProgressEntry> = Vec::new(env);
+                for index in 1..=count {
+                    if let Some(entry) = env
+                        .storage()
+                        .persistent()
+                        .get::<DataKey, ProgressEntry>(&DataKey::HistoryEntry(cursor, index))
+                    {
+                        history.push_back(entry);
+                    }
+                }
+                env.storage().persistent().set(&vec_key, &history);
+                env.storage().persistent().extend_ttl(
+                    &vec_key,
+                    PERSISTENT_TTL_MIN,
+                    PERSISTENT_TTL_MAX,
+                );
+            }
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::MigrationCursor(0), &cursor);
+            processed = processed.saturating_add(1);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MigrationProcessed, &processed);
+    }
+
     fn require_not_paused(env: &Env) -> Result<(), ProgressError> {
         if env
             .storage()
@@ -504,15 +677,15 @@ mod tests {
         let (_, client, validator) = setup();
         let player_id = 1u64;
 
-        // Unverified → VerifiedIdentity
+        // Unverified â†’ VerifiedIdentity
         let l1 = client.advance_level(&validator, &player_id, &1u32);
         assert_eq!(l1, ProgressLevel::VerifiedIdentity);
 
-        // VerifiedIdentity → PerformanceMilestones
+        // VerifiedIdentity â†’ PerformanceMilestones
         let l2 = client.advance_level(&validator, &player_id, &2u32);
         assert_eq!(l2, ProgressLevel::PerformanceMilestones);
 
-        // PerformanceMilestones → EliteTier
+        // PerformanceMilestones â†’ EliteTier
         let l3 = client.advance_level(&validator, &player_id, &3u32);
         assert_eq!(l3, ProgressLevel::EliteTier);
 
@@ -525,7 +698,7 @@ mod tests {
         let player_id = 42u64;
         let milestone = 7u32;
 
-        // Advance once: Unverified → VerifiedIdentity
+        // Advance once: Unverified â†’ VerifiedIdentity
         client.advance_level(&validator, &player_id, &milestone);
 
         // History index starts at 1
@@ -584,7 +757,7 @@ mod tests {
         let (env, client, _verification) = setup();
 
         // A random address that is NOT the verification contract must be
-        // rejected by require_auth — with mock_all_auths off it would panic,
+        // rejected by require_auth â€” with mock_all_auths off it would panic,
         // but with mock_all_auths on the address mismatch in the whitelist
         // logic means the verification_contract.require_auth() is satisfied
         // by the mock, so we need to clear mocks for this test.
@@ -608,7 +781,7 @@ mod tests {
 
         assert_eq!(history.len(), 3);
 
-        // Entry 1: Unverified → VerifiedIdentity
+        // Entry 1: Unverified â†’ VerifiedIdentity
         assert_eq!(history.get(0).unwrap().old_level, ProgressLevel::Unverified);
         assert_eq!(
             history.get(0).unwrap().new_level,
@@ -616,7 +789,7 @@ mod tests {
         );
         assert_eq!(history.get(0).unwrap().milestone_ref, 1u32);
 
-        // Entry 2: VerifiedIdentity → PerformanceMilestones
+        // Entry 2: VerifiedIdentity â†’ PerformanceMilestones
         assert_eq!(
             history.get(1).unwrap().old_level,
             ProgressLevel::VerifiedIdentity
@@ -627,7 +800,7 @@ mod tests {
         );
         assert_eq!(history.get(1).unwrap().milestone_ref, 2u32);
 
-        // Entry 3: PerformanceMilestones → EliteTier
+        // Entry 3: PerformanceMilestones â†’ EliteTier
         assert_eq!(
             history.get(2).unwrap().old_level,
             ProgressLevel::PerformanceMilestones
@@ -659,23 +832,23 @@ mod tests {
         client.advance_level(&validator, &player_id, &2u32);
         client.advance_level(&validator, &player_id, &3u32);
 
-        // First page: offset=0, limit=2 → entries 1,2
+        // First page: offset=0, limit=2 â†’ entries 1,2
         let page1 = client.get_progress_history_page(&player_id, &0u32, &2u32);
         assert_eq!(page1.len(), 2);
         assert_eq!(page1.get(0).unwrap().old_level, ProgressLevel::Unverified);
         assert_eq!(page1.get(1).unwrap().old_level, ProgressLevel::VerifiedIdentity);
 
-        // Middle page: offset=1, limit=1 → entry 2
+        // Middle page: offset=1, limit=1 â†’ entry 2
         let mid = client.get_progress_history_page(&player_id, &1u32, &1u32);
         assert_eq!(mid.len(), 1);
         assert_eq!(mid.get(0).unwrap().old_level, ProgressLevel::VerifiedIdentity);
 
-        // Last page: offset=2, limit=50 → entry 3 only
+        // Last page: offset=2, limit=50 â†’ entry 3 only
         let last = client.get_progress_history_page(&player_id, &2u32, &50u32);
         assert_eq!(last.len(), 1);
         assert_eq!(last.get(0).unwrap().new_level, ProgressLevel::EliteTier);
 
-        // Offset beyond count → empty
+        // Offset beyond count â†’ empty
         let empty = client.get_progress_history_page(&player_id, &10u32, &5u32);
         assert_eq!(empty.len(), 0);
     }
@@ -685,14 +858,14 @@ mod tests {
         let (env, client, validator) = setup();
         let player_id = 5u64;
 
-        // Advance once: Unverified → VerifiedIdentity
+        // Advance once: Unverified â†’ VerifiedIdentity
         client.advance_level(&validator, &player_id, &1u32);
 
         // env.events().all() returns ContractEvents which compares against
         // soroban_sdk::Vec<(Address, Vec<Val>, Val)>:
         //   - Address  : the contract that emitted the event
-        //   - Vec<Val> : topics  — (Symbol("progress_updated"), updated_by)
-        //   - Val      : data    — (player_id, old_level, new_level)
+        //   - Vec<Val> : topics  â€” (Symbol("progress_updated"), updated_by)
+        //   - Val      : data    â€” (player_id, old_level, new_level)
         let contract_id = client.address.clone();
         assert_eq!(
             env.events().all(),
@@ -725,7 +898,7 @@ mod tests {
         client.advance_level(&validator, &player_id, &1u32);
         client.advance_level(&validator, &player_id, &2u32);
         client.advance_level(&validator, &player_id, &3u32);
-        // This should panic — already at EliteTier
+        // This should panic â€” already at EliteTier
         client.advance_level(&validator, &player_id, &4u32);
     }
 
@@ -733,7 +906,7 @@ mod tests {
     fn test_transfer_admin_success() {
         let (env, client, _) = setup();
         let new_admin = Address::generate(&env);
-        // Should not panic — current admin auth is satisfied
+        // Should not panic â€” current admin auth is satisfied
         client.transfer_admin(&new_admin);
     }
 
@@ -741,7 +914,7 @@ mod tests {
     #[should_panic]
     fn test_transfer_admin_unauthorized() {
         let (env, client, _) = setup();
-        // Clear all mocks — no auth satisfied, so admin check fails
+        // Clear all mocks â€” no auth satisfied, so admin check fails
         env.mock_auths(&[]);
         client.transfer_admin(&Address::generate(&env));
     }
@@ -782,7 +955,7 @@ mod tests {
         let new_admin = Address::generate(&env);
         client.transfer_admin(&new_admin);
 
-        // Clear mocks — old admin auth no longer stored, so pause must fail
+        // Clear mocks â€” old admin auth no longer stored, so pause must fail
         env.mock_auths(&[]);
         client.pause_contract();
     }
@@ -877,6 +1050,185 @@ mod tests {
 
         let result = client.try_advance_level(&validator, &player_id, &4u32);
         assert_eq!(result, Err(Ok(ProgressError::AlreadyAtMaxLevel)));
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #1384: storage schema version + resumable migrate()
+    // -------------------------------------------------------------------------
+
+    /// Rewind storage to the pre-versioning layout so a migration can be
+    /// rehearsed against a contract that has real history in it.
+    ///
+    /// A real upgrade leaves exactly this state: the old WASM's keys, and no
+    /// `SchemaVersion`, because the key did not exist when they were written.
+    fn simulate_v0_contract(env: &Env, client: &ProgressContractClient<'static>) {
+        env.as_contract(&client.address, || {
+            env.storage().instance().remove(&DataKey::SchemaVersion);
+            // Drop the backfilled Vec for a player that has history entries, so
+            // the migration has real work to do rather than a no-op.
+            env.storage().persistent().remove(&DataKey::HistoryVec(1));
+        });
+    }
+
+    #[test]
+    fn test_fresh_contract_reports_current_schema_version() {
+        let (_env, client, _v) = setup();
+        assert_eq!(client.schema_version(), CODE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_unversioned_contract_reports_zero() {
+        let (env, client, _v) = setup();
+        simulate_v0_contract(&env, &client);
+        assert_eq!(client.schema_version(), 0);
+    }
+
+    #[test]
+    fn test_migrate_backfills_history_vec_for_v0_contract() {
+        let (env, client, validator) = setup();
+        client.advance_level(&validator, &1u64, &1u32);
+        simulate_v0_contract(&env, &client);
+
+        // The per-index entries survive; only the single-key Vec is gone.
+        assert_eq!(client.get_history_count(&1u64), 1);
+        assert!(client.get_progress_history(&1u64).is_empty());
+
+        let status = client.migrate(&1u32, &10u32);
+
+        assert_eq!(status.from, 0);
+        assert_eq!(status.to, 1);
+        assert_eq!(status.current, 1);
+        assert!(status.complete);
+        assert!(!status.pending);
+        assert_eq!(client.schema_version(), CODE_SCHEMA_VERSION);
+        assert_eq!(client.get_progress_history(&1u64).len(), 1);
+    }
+
+    #[test]
+    fn test_migrated_history_matches_the_indexed_entries() {
+        let (env, client, validator) = setup();
+        client.advance_level(&validator, &7u64, &1u32);
+        client.advance_level(&validator, &7u64, &2u32);
+        simulate_v0_contract(&env, &client);
+
+        client.migrate(&1u32, &100u32);
+
+        let history = client.get_progress_history(&7u64);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.get(0).unwrap().milestone_ref, 1);
+        assert_eq!(history.get(1).unwrap().milestone_ref, 2);
+    }
+
+    #[test]
+    fn test_migrate_emits_schema_migrated_event() {
+        let (env, client, _v) = setup();
+        simulate_v0_contract(&env, &client);
+
+        client.migrate(&1u32, &10u32);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events.get(0).unwrap(),
+            (
+                client.address.clone(),
+                (Symbol::new(&env, "schema_migrated"),).into_val(&env),
+                (0u32, 1u32).into_val(&env)
+            )
+        );
+    }
+
+    #[test]
+    fn test_migrate_is_idempotent() {
+        let (env, client, _v) = setup();
+        simulate_v0_contract(&env, &client);
+
+        client.migrate(&1u32, &10u32);
+        let second = client.migrate(&1u32, &10u32);
+
+        assert_eq!(second.from, 1);
+        assert_eq!(second.to, 1);
+        assert!(second.complete);
+        // A repeated call must not re-emit, or an upgrade script that retries
+        // would produce a second event for one logical migration.
+        assert_eq!(env.events().all().len(), 1);
+    }
+
+    #[test]
+    fn test_migrate_advances_the_cursor() {
+        let (env, client, _v) = setup();
+        simulate_v0_contract(&env, &client);
+
+        let first = client.migrate(&1u32, &5u32);
+        assert_eq!(first.last_visited_id, 5);
+        assert_eq!(first.processed, 5);
+
+        let second = client.migrate(&1u32, &5u32);
+        assert_eq!(second.last_visited_id, 10);
+        assert_eq!(second.processed, 10);
+    }
+
+    #[test]
+    fn test_migrate_resumes_rather_than_restarting() {
+        let (env, client, validator) = setup();
+        // Player 9 sits beyond the first slice, so a migration that restarted
+        // from zero each call would never reach it.
+        client.advance_level(&validator, &9u64, &1u32);
+        env.as_contract(&client.address, || {
+            env.storage().instance().remove(&DataKey::SchemaVersion);
+            env.storage().persistent().remove(&DataKey::HistoryVec(9));
+        });
+
+        client.migrate(&1u32, &3u32);
+        assert!(client.get_progress_history(&9u64).is_empty());
+
+        client.migrate(&1u32, &100u32);
+        assert_eq!(client.get_progress_history(&9u64).len(), 1);
+    }
+
+    #[test]
+    fn test_migrate_rejects_downgrade() {
+        let (env, client, _v) = setup();
+        simulate_v0_contract(&env, &client);
+        client.migrate(&1u32, &10u32);
+
+        // Storage is at 1; asking for 0 would discard data the code expects.
+        let result = client.try_migrate(&0u32, &10u32);
+        assert_eq!(result, Err(Ok(ProgressError::SchemaVersionTooNew)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_unknown_target() {
+        let (_env, client, _v) = setup();
+        let result = client.try_migrate(&99u32, &10u32);
+        assert_eq!(result, Err(Ok(ProgressError::UnknownSchemaTarget)));
+    }
+
+    #[test]
+    fn test_migrate_with_zero_budget_does_not_advance_cursor() {
+        let (env, client, _v) = setup();
+        simulate_v0_contract(&env, &client);
+
+        // A zero budget must not silently mark the migration done.
+        let status = client.migrate(&1u32, &0u32);
+        assert_eq!(status.last_visited_id, 0);
+        assert_eq!(status.processed, 0);
+    }
+
+    #[test]
+    fn test_upgrade_preserves_schema_version_key() {
+        let (env, client, _v) = setup();
+        simulate_v0_contract(&env, &client);
+
+        let new_wasm_hash = env
+            .deployer()
+            .upload_contract_wasm(soroban_sdk::Bytes::new(&env));
+        client.upgrade(&new_wasm_hash);
+
+        // upgrade() swaps the WASM and nothing else: storage is untouched, so
+        // a migrated contract stays migrated and an unmigrated one stays
+        // unmigrated until migrate() is called.
+        assert_eq!(client.schema_version(), 0);
     }
 }
 }
