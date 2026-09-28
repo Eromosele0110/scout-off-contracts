@@ -17,11 +17,15 @@ pub const CODE_SCHEMA_VERSION: u32 = 1;
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProgressEntry {
+    /// Unique player identifier whose level changed.
     pub player_id: u64,
+    /// Player level before this history entry was recorded.
     pub old_level: ProgressLevel,
+    /// Player level after this history entry was recorded.
     pub new_level: ProgressLevel,
     /// Wallet that triggered the update (validator or scout)
     pub updated_by: Address,
+    /// Ledger timestamp when the level change was recorded, in Unix seconds.
     pub updated_at: u64,
     /// Milestone index from the verification contract that triggered this
     pub milestone_ref: u32,
@@ -32,8 +36,11 @@ pub struct ProgressEntry {
 #[contracttype]
 pub enum DataKey {
     /// The `Address` of the contract administrator. Set during `initialize` and
-    /// updated by `transfer_admin`. Required for all privileged operations.
+    /// updated by `accept_admin`. Required for all privileged operations.
     Admin,
+    /// Proposed replacement admin. The address stored here must call
+    /// `accept_admin` before `Admin` is updated.
+    PendingAdmin,
     /// Boolean flag (`true`) written during `initialize`. Absence or `false`
     /// means the contract has not yet been set up; `health()` reads this key.
     Initialized,
