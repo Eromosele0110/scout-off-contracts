@@ -515,6 +515,11 @@ pub enum DataKey {
     /// Voting window (seconds) within which `threshold` distinct votes must
     /// accumulate before a claim expires. See `get_voting_window_secs`.
     AttestationVotingWindowSecs,
+    /// Complete set of validator wallets that co-attested a committed
+    /// threshold milestone, keyed by (player_id, milestone_index).
+    /// Populated at commit time; used by cascade sweep, per-validator
+    /// caps, dispute conflict-of-interest, and activity reports.
+    MilestoneAttestors(u64, u32),
 
     // ── Registration cross-contract (issue #1014) ──
     /// Address of the registration contract used to verify wallet↔player_id binding.
