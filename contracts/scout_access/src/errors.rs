@@ -149,6 +149,13 @@ pub enum ScoutAccessError {
     /// or by a Pro-tier scout attempting to contact a Level-3 player.
     /// Basic tier has no contact entitlement; Pro tier is capped at Level 2.
     TierNotPermitted = 41,
+
+    /// `revoke_evidence_access` attempted to revoke a grant that was already
+    /// revoked (by admin or player).
+    GrantAlreadyRevoked = 42,
+    /// `revoke_evidence_access` caller's wallet does not own the `player_id`
+    /// passed to the function, or the player is not registered.
+    PlayerNotVerified = 43,
 }
 
 impl AdminError for ScoutAccessError {
@@ -222,6 +229,16 @@ mod tests {
     #[test]
     fn grant_not_found_is_code_38() {
         assert_eq!(ScoutAccessError::GrantNotFound as u32, 38);
+    }
+
+    #[test]
+    fn grant_already_revoked_is_code_42() {
+        assert_eq!(ScoutAccessError::GrantAlreadyRevoked as u32, 42);
+    }
+
+    #[test]
+    fn player_not_verified_is_code_43() {
+        assert_eq!(ScoutAccessError::PlayerNotVerified as u32, 43);
     }
 
     #[test]

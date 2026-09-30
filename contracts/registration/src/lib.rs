@@ -1352,6 +1352,18 @@ impl RegistrationContract {
         Self::load_player(&env, player_id)
     }
 
+    /// Return just the `player_id` for a given wallet address, without loading
+    /// the full `PlayerProfile` (which requires a cross-contract call to the
+    /// progress contract for `level`). Used by the scout_access contract to
+    /// verify player ownership of an `EvidenceAccessGrant` without paying the
+    /// full-profile resolution cost.
+    pub fn get_player_id_by_wallet(env: Env, wallet: Address) -> Result<u64, ScoutChainError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PlayerByWallet(wallet))
+            .ok_or(ScoutChainError::PlayerNotFound)
+    }
+
     pub fn get_player_status(env: Env, player_id: u64) -> Result<PlayerStatus, ScoutChainError> {
         Self::load_stored_player(&env, player_id)?;
         if env

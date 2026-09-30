@@ -81,6 +81,9 @@ mod registration_contract {
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u32)]
     pub enum RegClientError {
+        /// Matches `ScoutChainError::PlayerNotFound` (code 3).
+        PlayerNotFound = 3,
+        /// Matches `ScoutChainError::ScoutNotFound` (code 12).
         ScoutNotFound = 12,
     }
 
@@ -88,6 +91,7 @@ mod registration_contract {
     #[allow(dead_code)]
     pub trait RegistrationContractClient {
         fn get_scout_by_wallet(env: Env, wallet: Address) -> Result<ScoutProfile, RegClientError>;
+        fn get_player_id_by_wallet(env: Env, wallet: Address) -> Result<u64, RegClientError>;
         fn is_scout_deactivated(env: Env, scout_id: u64) -> bool;
     }
 }
@@ -163,6 +167,11 @@ const BATCH_CONTACT_MAX_SIZE: u32 = 20;
 // next) regardless of `offset` or total grant count. See ci/cpu-cost-budget.md.
 const ACCESS_GRANT_PAGE_SIZE: u32 = 50;
 const MAX_ACCESS_GRANT_PAGE_LIMIT: u32 = 50;
+
+// #1380: Evidence access grants carry an on-chain expiry. 90 days in seconds.
+// The grant record itself is never deleted (append-only audit trail);
+// expiry only affects the *live entitlement* check in `has_evidence_access`.
+const EVIDENCE_ACCESS_GRANT_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 
 #[contract]
 pub struct ScoutAccessContract;
@@ -997,6 +1006,7 @@ impl ScoutAccessContract {
         scout: &Address,
         tier: &SubscriptionTier,
         granted_at: u64,
+        expires_at: u64,
     ) -> Result<(), ScoutAccessError> {
         let count_key = DataKey::EvidenceAccessGrantCount(player_id);
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
@@ -1025,6 +1035,7 @@ impl ScoutAccessContract {
             player_id,
             scout: scout.clone(),
             granted_at,
+            expires_at,
             tier_at_grant: tier.clone(),
             revoked: false,
             revoked_at: None,
@@ -1186,6 +1197,7 @@ impl ScoutAccessContract {
             &scout,
             &subscription.tier,
             record.contacted_at,
+            record.contacted_at.saturating_add(EVIDENCE_ACCESS_GRANT_TTL_SECS),
         )?;
 
         events::player_contacted(&env, player_id, &scout, config.contact_fee_stroops);
@@ -1332,7 +1344,14 @@ impl ScoutAccessContract {
             // contact this batch call actually recorded (and charged) — a
             // scout must not be able to bypass evidence-access grants by
             // reaching a contact through the batch entrypoint instead.
-            Self::grant_evidence_access(&env, player_id, &scout, &sub.tier, record.contacted_at)?;
+            Self::grant_evidence_access(
+                &env,
+                player_id,
+                &scout,
+                &sub.tier,
+                record.contacted_at,
+                record.contacted_at.saturating_add(EVIDENCE_ACCESS_GRANT_TTL_SECS),
+            )?;
 
             events::player_contacted(&env, player_id, &scout, config.contact_fee_stroops);
         }
@@ -2262,11 +2281,11 @@ impl ScoutAccessContract {
     /// for `player_id`. The off-chain key-wrapping service calls this (or
     /// `get_evidence_access_grant`) before honoring a key-wrap request.
     pub fn has_evidence_access(env: Env, player_id: u64, scout: Address) -> bool {
+        let now = env.ledger().timestamp();
         env.storage()
             .persistent()
             .get::<DataKey, EvidenceAccessGrant>(&DataKey::EvidenceAccessGrant(player_id, scout))
-            .map(|g| !g.revoked)
-            .unwrap_or(false)
+            .is_some_and(|g| !g.revoked && g.expires_at > now)
     }
 
     /// Return the full `EvidenceAccessGrant` record for (player_id, scout),
@@ -2387,6 +2406,81 @@ impl ScoutAccessContract {
 
         events::evidence_access_revoked(&env, player_id, &scout, &admin);
         Ok(())
+    }
+
+    /// Player-initiated revocation of an evidence access grant.
+    ///
+    /// Allows a player to revoke a scout's access to their confidential
+    /// evidence by calling with their own authenticated wallet. The player's
+    /// ownership of `player_id` is verified through the registration contract
+    /// (`get_player_id_by_wallet`); if the registration contract is not
+    /// configured, the call is rejected with `PlayerNotVerified`.
+    ///
+    /// Like `admin_revoke_evidence_access`, this does **not** delete the
+    /// grant record — it is an append-only fact that this scout *was*
+    /// authorized at `granted_at`. Revocation only instructs the off-chain
+    /// key-wrapping service to stop honoring *future* key-wrap requests for
+    /// this `(player_id, scout)` pair; it cannot claw back a wrapped key
+    /// already delivered before the revoke (see `docs/EVIDENCE_PRIVACY.md`).
+    ///
+    /// Idempotent: revoking an already-revoked grant returns
+    /// `GrantAlreadyRevoked`. A grant that was never issued returns
+    /// `GrantNotFound`.
+    pub fn revoke_evidence_access(
+        env: Env,
+        player: Address,
+        player_id: u64,
+        scout: Address,
+    ) -> Result<(), ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        Self::require_not_paused(&env)?;
+        Self::require_initialized(&env)?;
+        player.require_auth();
+
+        let grant_key = DataKey::EvidenceAccessGrant(player_id, scout.clone());
+        let grant: EvidenceAccessGrant = env
+            .storage()
+            .persistent()
+            .get(&grant_key)
+            .ok_or(ScoutAccessError::GrantNotFound)?;
+
+        if grant.revoked {
+            return Err(ScoutAccessError::GrantAlreadyRevoked);
+        }
+
+        Self::verify_player_ownership(&env, &player, player_id)?;
+
+        let mut grant = grant;
+        grant.revoked = true;
+        grant.revoked_at = Some(env.ledger().timestamp());
+        env.storage().persistent().set(&grant_key, &grant);
+        env.storage()
+            .persistent()
+            .extend_ttl(&grant_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        events::evidence_access_revoked_by_player(&env, player_id, &scout, &player);
+        Ok(())
+    }
+
+    /// Verify that `player` Address owns `player_id` through the registration
+    /// contract's `get_player_id_by_wallet` cross-contract call.
+    /// Returns `PlayerNotVerified` if the registration contract is not
+    /// configured or the wallet does not match the `player_id`.
+    fn verify_player_ownership(
+        env: &Env,
+        player: &Address,
+        player_id: u64,
+    ) -> Result<(), ScoutAccessError> {
+        let reg_contract_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RegistrationContract)
+            .ok_or(ScoutAccessError::PlayerNotVerified)?;
+        let reg_client = registration_contract::Client::new(env, &reg_contract_addr);
+        match reg_client.try_get_player_id_by_wallet(player) {
+            Ok(Ok(id)) if id == player_id => Ok(()),
+            _ => Err(ScoutAccessError::PlayerNotVerified),
+        }
     }
 
     pub fn get_trial_offer(

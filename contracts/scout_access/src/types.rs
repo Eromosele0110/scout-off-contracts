@@ -158,10 +158,10 @@ pub struct FeeConfigHistoryEntry {
 /// call (see `docs/EVIDENCE_PRIVACY.md`). This is an append-only fact about
 /// the past ("this scout was once entitled to see this evidence"), not a
 /// live entitlement check — it is never mutated except by
-/// `admin_revoke_evidence_access` flipping `revoked`. Subscription downgrade
-/// or expiry does not touch it. Revocation only ever gates *future*
-/// off-chain key-wrap requests; it cannot claw back a key that was already
-/// delivered before the revoke.
+/// `admin_revoke_evidence_access` or `revoke_evidence_access` flipping
+/// `revoked`. Subscription downgrade or expiry does not touch it.
+/// Revocation only ever gates *future* off-chain key-wrap requests; it
+/// cannot claw back a key that was already delivered before the revoke.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EvidenceAccessGrant {
@@ -171,12 +171,19 @@ pub struct EvidenceAccessGrant {
     pub scout: Address,
     /// Ledger timestamp (Unix seconds) when the grant was issued.
     pub granted_at: u64,
+    /// Ledger timestamp (Unix seconds) at which the grant expires and is
+    /// no longer considered active. `has_evidence_access` returns `false`
+    /// once the current ledger time exceeds this value. The grant record
+    /// itself is retained (append-only audit trail); only the *live*
+    /// entitlement check changes.
+    pub expires_at: u64,
     /// The scout's subscription tier at the moment the grant was issued.
     /// Recorded for audit purposes; it is not re-checked afterward.
     pub tier_at_grant: SubscriptionTier,
-    /// True once an admin has revoked this grant via
-    /// `admin_revoke_evidence_access`. The record is kept (never deleted) so
-    /// the audit trail of who was ever granted access stays intact.
+    /// True once a grant has been revoked via `admin_revoke_evidence_access`
+    /// (admin-initiated) or `revoke_evidence_access` (player-initiated).
+    /// The record is kept (never deleted) so the audit trail of who was
+    /// ever granted access stays intact.
     pub revoked: bool,
     /// Ledger timestamp (Unix seconds) of revocation, if any.
     pub revoked_at: Option<u64>,
@@ -294,7 +301,8 @@ pub enum DataKey {
     /// (player_id, scout) → EvidenceAccessGrant. Canonical grant record;
     /// see `docs/EVIDENCE_PRIVACY.md`. Written once by `pay_to_contact` /
     /// `batch_contact_players` and only ever mutated by
-    /// `admin_revoke_evidence_access` (flips `revoked`/`revoked_at`).
+    /// `admin_revoke_evidence_access` or `revoke_evidence_access` (player-initiated)
+    /// flipping `revoked`/`revoked_at`.
     EvidenceAccessGrant(u64, Address),
     /// Monotonic count of grants ever issued for `player_id`, used to place
     /// the next grant into `EvidenceAccessGrantPage(player_id, count / PAGE_SIZE)`.

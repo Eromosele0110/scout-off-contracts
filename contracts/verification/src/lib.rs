@@ -88,7 +88,17 @@ const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_REG_COOLDOWN_SECS: u64 = 0;
 
 /// Domain separator for off-chain milestone attestation messages.
-const ATTESTATION_DOMAIN: &str = "ScoutChain-MilestoneAttestation-v1";
+/// v2 — adds `expires_at` to the signed payload (issue #1381).
+const ATTESTATION_DOMAIN: &str = "ScoutChain-MilestoneAttestation-v2";
+
+/// Maximum future offset (seconds) allowed for `expires_at` on an attestation.
+/// Prevents validators from signing payloads that remain valid for an
+/// unbounded window, which would widen the replay surface if a signature
+/// leaks.  1 hour is sufficient for typical relay latency.
+const MAX_ATTESTATION_FUTURE_TOLERANCE_SECS: u64 = 3_600;
+
+/// Number of bits in the attestation nonce replay-protection bitmap.
+const ATTESTATION_NONCE_BITMAP_BITS: u32 = 256;
 
 // ── k-of-n threshold milestone attestation ──
 //
@@ -2069,12 +2079,64 @@ impl VerificationContract {
             return Err(VerificationError::ValidatorInactive);
         }
 
-        // Strictly-increasing per-validator nonce (atomic with commit below).
-        let nonce_key = DataKey::AttestationNonce(validator_wallet.clone());
-        let last_nonce: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0u64);
-        if attestation.nonce <= last_nonce {
+        // ── Expiry checks (issue #1381) ──
+        let now = env.ledger().timestamp();
+        if attestation.expires_at <= now {
+            return Err(VerificationError::AttestationExpired);
+        }
+        if attestation.expires_at > now.saturating_add(MAX_ATTESTATION_FUTURE_TOLERANCE_SECS) {
+            return Err(VerificationError::AttestationWindowTooLarge);
+        }
+
+        // ── Bitmap nonce verification (issue #1381) ──
+        // Replaces the previous strictly-increasing single `u64` nonce check with
+        // a 256-bit sliding window: nonces within [base, base+255] are accepted
+        // (each at most once); nonces >= base+256 advance the window forward.
+        let base_key = DataKey::AttestationNonceBase(validator_wallet.clone());
+        let bitmap_key = DataKey::AttestationNonceBitmap(validator_wallet.clone());
+
+        let mut base: u64 = env
+            .storage()
+            .persistent()
+            .get(&base_key)
+            .unwrap_or(0u64);
+
+        let mut bitmap: Bytes = env
+            .storage()
+            .persistent()
+            .get(&bitmap_key)
+            .unwrap_or_else(|| Bytes::from_array(&env, &[0u8; 32]));
+
+        // Reject nonces that fall behind the current window.
+        if attestation.nonce < base {
             return Err(VerificationError::InvalidNonce);
         }
+
+        // If the nonce is far ahead, advance the window base to it and
+        // reset the bitmap (old accepted nonces are now below `base`).
+        if attestation.nonce >= base.saturating_add(ATTESTATION_NONCE_BITMAP_BITS as u64) {
+            base = attestation.nonce;
+            bitmap = Bytes::from_array(&env, &[0u8; 32]);
+        }
+
+        let bit_index = (attestation.nonce - base) as u32;
+        let byte_index = bit_index / 8;
+        let bit_in_byte = bit_index % 8;
+
+        let byte = match bitmap.get(byte_index) {
+            Some(b) => b,
+            None => 0u8,
+        };
+        let mask = 1u8 << bit_in_byte;
+
+        if byte & mask != 0 {
+            // This nonce has already been consumed.
+            return Err(VerificationError::InvalidNonce);
+        }
+
+        // Mark the nonce as consumed.
+        let new_byte = byte | mask;
+        bitmap.set(byte_index, new_byte);
 
         let index = Self::commit_approved_milestone(
             &env,
@@ -2084,24 +2146,53 @@ impl VerificationContract {
             attestation.evidence_hash.clone(),
         )?;
 
-        // Persist nonce only after successful commit so a failed commit does
-        // not burn the nonce (tx revert would roll this back on-chain anyway).
-        env.storage()
-            .persistent()
-            .set(&nonce_key, &attestation.nonce);
-        env.storage()
-            .persistent()
-            .extend_ttl(&nonce_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        // Persist the bitmap nonce state after successful commit.
+        env.storage().persistent().set(&base_key, &base);
+        env.storage().persistent().extend_ttl(
+            &base_key,
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+        env.storage().persistent().set(&bitmap_key, &bitmap);
+        env.storage().persistent().extend_ttl(
+            &bitmap_key,
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
 
         Ok(index)
     }
 
-    /// Return the last consumed attestation nonce for `wallet` (0 if none).
+    /// Return the highest accepted attestation nonce for `wallet` (0 if none).
+    ///
+    /// Computed from the bitmap base and the highest set bit, so indexers that
+    /// only need a progress indicator continue to work without changes.
     pub fn get_attestation_nonce(env: Env, wallet: Address) -> u64 {
-        env.storage()
+        let base: u64 = env
+            .storage()
             .persistent()
-            .get(&DataKey::AttestationNonce(wallet))
-            .unwrap_or(0u64)
+            .get(&DataKey::AttestationNonceBase(wallet.clone()))
+            .unwrap_or(0u64);
+        let bitmap: Bytes = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AttestationNonceBitmap(wallet))
+            .unwrap_or_else(|| Bytes::from_array(&env, &[0u8; 32]));
+
+        // Find the highest set bit by scanning bytes from the end.
+        for byte_idx in (0..32u32).rev() {
+            let byte = bitmap.get(byte_idx).unwrap_or(0u8);
+            if byte != 0 {
+                // Find the highest set bit in this byte (bit 7 down to bit 0).
+                for bit_idx in (0..8u32).rev() {
+                    if (byte >> bit_idx) & 1 != 0 {
+                        let bit = byte_idx * 8 + bit_idx;
+                        return base + bit as u64;
+                    }
+                }
+            }
+        }
+        base
     }
 
     /// Return the registered attestation public key for `wallet`, if any.
@@ -4781,6 +4872,10 @@ impl VerificationContract {
     }
 
     /// Canonical attestation message bytes for ed25519 signing/verification.
+    ///
+    /// The v2 domain adds `expires_at` to the signed payload so a stale
+    /// signature can be rejected even if the nonce bitmap window has slid
+    /// past the original nonce (issue #1381).
     fn attestation_message(env: &Env, attestation: &MilestoneAttestation) -> Bytes {
         let mut message = Bytes::new(env);
         message.extend_from_slice(ATTESTATION_DOMAIN.as_bytes());
@@ -4791,6 +4886,7 @@ impl VerificationContract {
         message.append(&attestation.description.clone().to_xdr(env));
         message.append(&attestation.evidence_hash.clone().to_xdr(env));
         message.extend_from_slice(&attestation.nonce.to_be_bytes());
+        message.extend_from_slice(&attestation.expires_at.to_be_bytes());
         message
     }
 }

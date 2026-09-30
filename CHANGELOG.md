@@ -34,6 +34,14 @@ Use the structure below for upcoming MINOR or MAJOR contract changes:
 
 > **Breaking-change classification rules:** See [docs/VERSIONING.md — What Constitutes a Breaking Change](VERSIONING.md#what-constitutes-a-breaking-change) for the full criteria (storage layout changes, function signature changes, error code renumbering, event schema changes, cross-contract interface changes).
 
+- Version: `v0.4.1`
+- Release date: `2026-09-30`
+- Contracts affected: `scout_access`, `registration`
+- Summary: Added player-initiated evidence access revocation and grant expiry (issue #1380). `EvidenceAccessGrant` gains an `expires_at` field (90-day TTL from `granted_at`); `has_evidence_access` now returns `false` for expired grants while retaining the record for audit. New `revoke_evidence_access(player, player_id, scout)` entrypoint lets a player revoke their own scout's evidence access grant after verifying ownership via the registration contract. `admin_revoke_evidence_access` returns a new `GrantAlreadyRevoked` (39) error when called on an already-revoked grant (it was previously a no-op). Registration contract gains `get_player_id_by_wallet(wallet)` cross-contract helper. New errors: `GrantAlreadyRevoked` (39), `PlayerNotVerified` (40). New event: `evidence_access_revoked_by_player`. Migration `005_evidence_access_grants.sql` adds `expires_at` column.
+- Classification: `Breaking (MAJOR)` (storage layout change — `EvidenceAccessGrant` gains `expires_at`; existing grants on-chain must be migrated or re-issued before the new WASM can decode them)
+
+---
+
 - Version: `v2.0.0`
 - Release date: `2026-09-27`
 - Contracts affected: `registration`, `scout_access`, `verification`

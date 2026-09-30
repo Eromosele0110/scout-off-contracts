@@ -36,7 +36,7 @@ use soroban_sdk::{
 };
 
 const CREDENTIALS: &str = "UEFA-B-License-2026";
-const ATTESTATION_DOMAIN: &str = "ScoutChain-MilestoneAttestation-v1";
+const ATTESTATION_DOMAIN: &str = "ScoutChain-MilestoneAttestation-v2";
 const DEFAULT_VOTING_WINDOW_SECS: u64 = 1_209_600; // 14 days — must match lib.rs default
 
 fn setup() -> (Env, VerificationContractClient<'static>, Address, Address) {
@@ -132,18 +132,19 @@ fn pubkey_bytesn(env: &Env, sk: &SigningKey) -> BytesN<32> {
     BytesN::from_array(env, &sk.verifying_key().to_bytes())
 }
 
-fn attestation_message(env: &Env, attestation: &MilestoneAttestation) -> Bytes {
-    let mut message = Bytes::new(env);
-    message.extend_from_slice(ATTESTATION_DOMAIN.as_bytes());
-    message.append(&attestation.contract_id.clone().to_xdr(env));
-    message.append(&Bytes::from_slice(env, &attestation.network_id.to_array()));
-    message.append(&attestation.validator_wallet.clone().to_xdr(env));
-    message.extend_from_slice(&attestation.player_id.to_be_bytes());
-    message.append(&attestation.description.clone().to_xdr(env));
-    message.append(&attestation.evidence_hash.clone().to_xdr(env));
-    message.extend_from_slice(&attestation.nonce.to_be_bytes());
-    message
-}
+    fn attestation_message(env: &Env, attestation: &MilestoneAttestation) -> Bytes {
+        let mut message = Bytes::new(env);
+        message.extend_from_slice(ATTESTATION_DOMAIN.as_bytes());
+        message.append(&attestation.contract_id.clone().to_xdr(env));
+        message.append(&Bytes::from_slice(env, &attestation.network_id.to_array()));
+        message.append(&attestation.validator_wallet.clone().to_xdr(env));
+        message.extend_from_slice(&attestation.player_id.to_be_bytes());
+        message.append(&attestation.description.clone().to_xdr(env));
+        message.append(&attestation.evidence_hash.clone().to_xdr(env));
+        message.extend_from_slice(&attestation.nonce.to_be_bytes());
+        message.extend_from_slice(&attestation.expires_at.to_be_bytes());
+        message
+    }
 
 fn sign_attestation(env: &Env, sk: &SigningKey, attestation: &MilestoneAttestation) -> BytesN<64> {
     let message = attestation_message(env, attestation);
@@ -194,6 +195,7 @@ fn submit_attested_milestone_is_closed_once_threshold_mode_is_configured() {
         description: String::from_str(&env, "hat-trick in regional final"),
         evidence_hash: cid(&env, 100),
         nonce: 1,
+        expires_at: env.ledger().timestamp() + 300,
         contract_id: contract_id.clone(),
         network_id: env.ledger().network_id(),
     };

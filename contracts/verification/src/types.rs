@@ -241,19 +241,23 @@ pub struct MilestoneRef {
     pub milestone_index: u32,
 }
 
-/// Off-chain signed milestone attestation (issue #703).
+/// Off-chain signed milestone attestation (issue #703, enhanced in #1381).
 ///
 /// Canonical signed message (domain-separated):
 /// `ATTESTATION_DOMAIN || contract_id || network_id || validator_wallet
-///  || player_id_be || description_bytes || evidence_hash_bytes || nonce_be`
+///  || player_id_be || description_bytes || evidence_hash_bytes || nonce_be
+///  || expires_at_be`
 ///
 /// Field rationale:
 /// - `validator_wallet`: binds the claim to a registry identity; after signature
 ///   verification against that wallet's registered pubkey, this is the sole
 ///   source of attribution (never a separate caller-supplied Address).
 /// - `player_id` / `description` / `evidence_hash`: exact claim being attested.
-/// - `nonce`: strictly-increasing per-validator counter for replay protection
-///   (raw ed25519 signatures have no Soroban sequence number).
+/// - `nonce`: replay-protection within a bounded 256-nonce sliding window
+///   (see `DataKey::AttestationNonceBase` / `AttestationNonceBitmap`).
+/// - `expires_at`: Unix timestamp (seconds) after which the attestation is
+///   rejected. Bounds the replay window for an off-chain signature that may be
+///   intercepted before it reaches a relayer.
 /// - `contract_id` + `network_id`: prevent cross-deployment / cross-network replay.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -266,8 +270,16 @@ pub struct MilestoneAttestation {
     pub description: String,
     /// IPFS/Arweave CID of supporting evidence.
     pub evidence_hash: String,
-    /// Strictly increasing per-validator nonce (must be > last accepted).
+    /// Monotonic per-validator nonce within a bounded window (see below).
+    /// Replaces the previous strictly-increasing check; the contract now
+    /// maintains a 256-bit bitmap (`AttestationNonceBitmap`) starting at
+    /// `AttestationNonceBase`, allowing nonces within a sliding window while
+    /// still rejecting replays.
     pub nonce: u64,
+    /// Unix timestamp (seconds, ledger time) after which this attestation is
+    /// no longer accepted. Must be > `env.ledger().timestamp()` at submission
+    /// and <= `timestamp + MAX_ATTESTATION_FUTURE_TOLERANCE_SECS`.
+    pub expires_at: u64,
     /// Must equal `env.current_contract_address()` at verification time.
     pub contract_id: Address,
     /// Must equal `env.ledger().network_id()` at verification time.
@@ -472,6 +484,12 @@ pub enum DataKey {
     /// Per-validator monotonic nonce for relayed attestation replay protection.
     /// Stores the last successfully consumed nonce (starts absent → treat as 0).
     AttestationNonce(Address),
+    /// Bounded nonce-window base for attestation replay protection (issue #1381).
+    /// Stores the lowest nonce still trackable in the sliding window.
+    AttestationNonceBase(Address),
+    /// 256-bit replay-protection bitmap for attestation nonces (issue #1381).
+    /// Bit `i` set ⇒ nonce `base + i` has been consumed.  32 bytes = 256 bits.
+    AttestationNonceBitmap(Address),
 
     // ── k-of-n threshold milestone attestation ──
     /// Pending (sub-threshold) milestone attestation accumulator, keyed by
