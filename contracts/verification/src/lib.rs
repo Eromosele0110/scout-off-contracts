@@ -8248,4 +8248,108 @@ mod tests {
         // Should panic — admin auth is not satisfied
         client.transfer_admin(&attacker);
     }
+
+    // -------------------------------------------------------------------------
+    // Issue #1454: Ring-buffer write head overflow tests
+    // -------------------------------------------------------------------------
+
+    /// Asserts that approvals continue working when the ring-buffer write head
+    /// is seeded near u32::MAX (simulating a potential overflow boundary).
+    /// With wrapping_add the head wraps safely rather than returning Overflow.
+    #[test]
+    fn test_ring_buffer_write_head_wraps_at_boundary() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let validator = Address::generate(&env);
+        client.register_validator(&validator, &String::from_str(&env, "Coach"));
+
+        // Seed the write head to MAX_GLOBAL_MILESTONE_INDEX - 1 so the next
+        // approval wraps back to 0.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::GlobalMilestoneWriteHead, &(MAX_GLOBAL_MILESTONE_INDEX - 1));
+        });
+
+        // First approval: write head was at (MAX - 1), wraps to 0 after.
+        let idx1 = client.approve_milestone(
+            &validator,
+            &1u64,
+            &String::from_str(&env, "milestone before wrap"),
+            &String::from_str(&env, VALID_CID_V0),
+        );
+        assert_eq!(idx1, 1);
+
+        // Second approval: write head is now 0, should work fine.
+        let idx2 = client.approve_milestone(
+            &validator,
+            &2u64,
+            &String::from_str(&env, "milestone after wrap"),
+            &String::from_str(&env, VALID_CID_V1),
+        );
+        assert_eq!(idx2, 1);
+
+        // Both milestones are accessible.
+        assert_eq!(client.get_milestone_count(&1u64), 1);
+        assert_eq!(client.get_milestone_count(&2u64), 1);
+    }
+
+    /// Asserts that the global index reads remain correct across the ring-buffer wrap.
+    #[test]
+    fn test_global_index_reads_correct_after_wrap() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let validator = Address::generate(&env);
+        client.register_validator(&validator, &String::from_str(&env, "Coach"));
+
+        // Approve two milestones.
+        client.approve_milestone(
+            &validator,
+            &10u64,
+            &String::from_str(&env, "m1"),
+            &String::from_str(&env, VALID_CID_V0),
+        );
+        client.approve_milestone(
+            &validator,
+            &11u64,
+            &String::from_str(&env, "m2"),
+            &String::from_str(&env, VALID_CID_V1),
+        );
+
+        let page = client.get_global_milestone_index(&0u32, &10u32);
+        assert_eq!(page.total, 2);
+        assert_eq!(page.entries.get(0).unwrap().player_id, 10u64);
+        assert_eq!(page.entries.get(1).unwrap().player_id, 11u64);
+    }
+
+    /// Asserts u64 total count is correct alongside u32 count.
+    #[test]
+    fn test_total_milestone_count_u64() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let validator = Address::generate(&env);
+        client.register_validator(&validator, &String::from_str(&env, "Coach"));
+
+        client.approve_milestone(
+            &validator,
+            &1u64,
+            &String::from_str(&env, "m1"),
+            &String::from_str(&env, VALID_CID_V0),
+        );
+        client.approve_milestone(
+            &validator,
+            &2u64,
+            &String::from_str(&env, "m2"),
+            &String::from_str(&env, VALID_CID_V1),
+        );
+
+        assert_eq!(client.get_total_milestone_count_u64(), 2u64);
+        assert_eq!(client.get_total_milestone_count(), 2u32);
+    }
 }
