@@ -189,6 +189,39 @@ pub struct EvidenceAccessGrant {
     pub revoked_at: Option<u64>,
 }
 
+/// Indicates which activation path was used when a FeeConfig was applied.
+///
+/// Stored in each `FeeConfigHistoryEntry` so auditors can distinguish
+/// between an immediate admin update, a decrease-branch proposal bypass,
+/// a time-locked proposal activation, and a migration seed.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum FeeConfigSource {
+    /// Applied immediately via `update_fee_config` (admin direct call).
+    Immediate,
+    /// Applied via `propose_fee_config` instant-decrease branch.
+    Decrease,
+    /// Applied via `activate_fee_config` after a time-locked proposal.
+    Proposal,
+    /// Applied via `admin_seed_fee_config` migration helper.
+    Seed,
+}
+
+/// One entry in the fee-configuration history ring-buffer.
+///
+/// History is capped at `FEE_CONFIG_HISTORY_CAP` entries in instance
+/// storage; older entries are evicted when the cap is exceeded.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeeConfigHistoryEntry {
+    /// The fee configuration that was activated.
+    pub config: FeeConfig,
+    /// Ledger timestamp when this config was activated, in Unix seconds.
+    pub activated_at: u64,
+    /// Which code path triggered this activation.
+    pub source: FeeConfigSource,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,

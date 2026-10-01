@@ -3437,6 +3437,47 @@ impl ScoutAccessContract {
         Ok(())
     }
 
+    /// Replace the active fee configuration, append a `FeeConfigHistoryEntry`
+    /// to the ring-buffer (capped at `FEE_CONFIG_HISTORY_CAP`), and emit
+    /// `fee_config_updated`.
+    ///
+    /// All public fee-config activation paths (`update_fee_config`,
+    /// `propose_fee_config` decrease branch, `activate_fee_config`,
+    /// `admin_seed_fee_config`) must go through this helper so that
+    /// `get_fee_config_history` captures every real fee change.
+    fn apply_fee_config(
+        env: &Env,
+        admin: &Address,
+        new_config: &FeeConfig,
+        source: FeeConfigSource,
+    ) {
+        let old_config = Self::fee_config(env);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfig, new_config);
+
+        // Append to history ring-buffer, evicting the oldest entry when full.
+        let mut history: soroban_sdk::Vec<FeeConfigHistoryEntry> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeConfigHistory)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        let entry = FeeConfigHistoryEntry {
+            config: new_config.clone(),
+            activated_at: env.ledger().timestamp(),
+            source,
+        };
+        history.push_back(entry);
+        while history.len() > FEE_CONFIG_HISTORY_CAP {
+            history.remove(0);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfigHistory, &history);
+
+        events::fee_config_updated(env, admin, &old_config, new_config);
+    }
+
     /// Numeric rank for a subscription tier (higher = more privileged).
     fn tier_rank(tier: &SubscriptionTier) -> u32 {
         match tier {
