@@ -1,3 +1,4 @@
+#![cfg_attr(target_family = "wasm", no_std)]
 // IMPORTANT: Cross-contract wiring required after deployment
 //
 // `approve_milestone` calls `advance_level` on the progress contract to update
@@ -10,7 +11,6 @@
 //
 // The easiest way is to run `./scripts/initialize.sh` which does this for you.
 // Without this step, milestones are recorded but player levels will NOT advance.
-#![cfg_attr(target_family = "wasm", no_std)]
 mod errors;
 pub mod events;
 mod types;
@@ -51,6 +51,9 @@ const MAX_VALIDATORS: u32 = 100;
 /// Maximum milestones a single validator may approve for one player.
 const MAX_MILESTONES_PER_PLAYER_PER_VALIDATOR: u32 = 5;
 
+// Bump applied to the admin key on every privileged call, so the admin address
+// cannot lapse out of persistent storage between privileged calls.
+const ADMIN_BUMP_LEDGERS: u32 = 100_000;
 /// Maximum number of milestones flagged per call in a for-cause revocation
 /// cascade sweep.  Keeps per-call CPU cost proportional to this limit rather
 /// than to the validator's total historical approval count.  A validator with
@@ -170,6 +173,9 @@ const ATTESTATION_VOTE_TTL_MARGIN_LEDGERS: u32 = 17_280;
 // The progress contract must be deployed and its address registered via
 // `set_progress_contract` before `approve_milestone` can advance levels.
 mod progress_contract {
+    soroban_sdk::contractimport!(
+        file = "fixtures/scoutchain_progress.wasm"
+    );
     soroban_sdk::contractimport!(file = "fixtures/scoutchain_progress.wasm");
 }
 
@@ -1079,6 +1085,13 @@ impl VerificationContract {
         if safe_add_u32(current_count, batch_len).map_err(|_| VerificationError::Overflow)?
             > MAX_VALIDATORS
         {
+            let progress_client = progress_contract::Client::new(&env, &progress_addr);
+            // AlreadyAtMaxLevel (6) is acceptable — milestone still recorded.
+            // Any other error propagates as ProgressCallFailed.
+            match progress_client.try_advance_level(&validator_wallet, &player_id, &next_index) {
+                Ok(_) => {}
+                Err(Ok(progress_contract::ProgressError::AlreadyAtMaxLevel)) => {}
+                Err(_) => return Err(VerificationError::ProgressCallFailed),
             return Err(VerificationError::ValidatorCapReached);
         }
 
@@ -7619,6 +7632,11 @@ mod tests {
             &None,
         );
 
+    #[test]
+    fn test_pause_unpause_events() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
         // Revoke with cause
         client.revoke_validator(
             &wallet_cause,

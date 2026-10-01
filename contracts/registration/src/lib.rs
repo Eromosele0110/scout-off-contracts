@@ -9,6 +9,8 @@ mod events;
 mod types;
 
 use types::{
+    ContractHealth, DataKey, FilterResult, PlayerProfile, PlayerSummary, PlayerVitals,
+    ProgressLevel, ScoutProfile, StoredPlayerProfile,
     ContractHealth, DataKey, FilterResult, PlayerProfile, PlayerStatus, PlayerSummary,
     ProgressLevel, RegistrationWiringState, ScoutProfile, ScoutStatus, ScoutVerificationRecord,
     StoredPlayerProfile,
@@ -48,6 +50,10 @@ const MAX_REGION_LEN: u32 = 100;
 const MAX_STRING_LEN: u32 = 64;
 const MAX_IPFS_HASHES: u32 = 10;
 const MAX_BATCH_SIZE: u32 = 20;
+
+// Bump applied to the admin key on every privileged call, so the admin address
+// cannot lapse out of persistent storage between privileged calls.
+const ADMIN_BUMP_LEDGERS: u32 = 100_000;
 /// Maximum plausible age for a registered player. Ages above this value are
 /// rejected as implausible to prevent corrupt entries in discovery filters.
 const MAX_PLAYER_AGE: u32 = 100;
@@ -625,6 +631,11 @@ impl RegistrationContract {
                 .set(&DataKey::PlayerIndex, &player_ids);
         }
 
+        // Remove from composite index. The index is keyed by level, and level is
+        // not stored here — it comes from the progress contract, so it has to be
+        // resolved before the profile is removed.
+        let level = Self::resolve_level(&env, player_id);
+        Self::composite_index_remove(&env, &level, &profile.vitals.region, player_id);
         // Remove from composite index
         Self::composite_index_remove(&env, &level, &profile.vitals.region, player_id);
         Self::level_index_remove(&env, &level, player_id);
@@ -957,6 +968,16 @@ impl RegistrationContract {
             registered_at,
         };
 
+            for player_id in ids.iter() {
+                if profiles.len() >= limit {
+                    break;
+                }
+                if cursor != 0 && player_id < cursor {
+                    continue;
+                }
+                if let Ok(profile) = Self::load_player(&env, player_id) {
+                    if profile.vitals.position == position {
+                        profiles.push_back(profile);
         env.storage()
             .persistent()
             .set(&DataKey::Scout(scout_id), &profile);
@@ -1688,6 +1709,8 @@ impl RegistrationContract {
                 .get(&DataKey::PlayerIndex)
                 .unwrap_or_else(|| Vec::new(&env));
 
+            if profiles.len() >= limit {
+                break;
             for player_id in all_ids.iter() {
                 // Skip deactivated players entirely (don't count toward offset).
                 if env
@@ -1716,6 +1739,10 @@ impl RegistrationContract {
                     results.push_back(profile);
                 }
             }
+        }
+
+        if let Some(last) = profiles.last() {
+            next_cursor = last.player_id;
         }
 
         Ok(FilterResult {
@@ -2754,6 +2781,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_preserves_admin() {
+    let env = Env::default();
         let env = Env::default();
         env.mock_all_auths();
 
@@ -2779,6 +2807,12 @@ mod tests {
         // Admin persisted
         client.pause_contract();
 
+    // Existing data persisted
+    assert_eq!(
+        client.get_player(&player_id).player_id,
+        player_id
+    );
+}
         // Existing data persisted
         assert_eq!(client.get_player(&player_id).player_id, player_id);
     }
@@ -2817,6 +2851,13 @@ mod tests {
         // Admin persisted — admin-gated call still works
         client.pause_contract();
         assert_eq!(client.get_player(&player_id).player_id, player_id);
+
+        // Same wallet can hold both roles after the upgrade
+        let region = String::from_str(&env, "Europe");
+        let scout_id = client.register_scout(&wallet, &region);
+        assert_eq!(scout_id, 1);
+        assert_eq!(client.get_player(&player_id).wallet, wallet);
+        assert_eq!(client.get_scout(&scout_id).wallet, wallet);
     }
 
     // -------------------------------------------------------------------------

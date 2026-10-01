@@ -5338,6 +5338,7 @@ pub struct TrialOffer {
 | 6 | `AlreadyAtMaxLevel` | Player is already at `EliteTier` |
 | 7 | `PlayerNotFound` | History index out of range |
 | 8 | `Overflow` | History counter overflowed |
+| 9 | `RegistrationCallFailed` | Cross-contract call to the registration contract failed when syncing a player's level |
 | 9 | `RegistrationCallFailed` | Cross-contract call to registration contract failed when syncing player level |
 | 10 | `PendingAdminNotSet` | `accept_admin` called without a pending proposal |
 | 11 | `MigrationNotActive` | Seeding attempted while the migration window is closed; call `open_migration_window` first |

@@ -1,3 +1,4 @@
+#![cfg_attr(target_family = "wasm", no_std)]
 #![no_std]
 
 mod errors;
@@ -14,6 +15,33 @@ pub use types::{DataKey, FrontierPeak, HistoryProofStep, ProgressEntry, Progress
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec};
 
+// Generated client for the registration contract — used to sync a player's
+// level back after a dispute reset. The registration contract must already be
+// deployed and its address set via `set_registration_contract`; without it the
+// level sync is simply skipped.
+mod registration_contract {
+    soroban_sdk::contractimport!(
+        file = "fixtures/scoutchain_registration.wasm"
+    );
+}
+
+/// The imported WASM carries its own `ProgressLevel` type, distinct from the
+/// one in shared-types, so the level has to be translated before it crosses the
+/// contract boundary. Both enums are declared in the same order, so this is a
+/// positional match rather than a string or numeric round-trip.
+fn to_imported_level(level: &ProgressLevel) -> registration_contract::ProgressLevel {
+    match level {
+        ProgressLevel::Unverified => registration_contract::ProgressLevel::Unverified,
+        ProgressLevel::VerifiedIdentity => {
+            registration_contract::ProgressLevel::VerifiedIdentity
+        }
+        ProgressLevel::PerformanceMilestones => {
+            registration_contract::ProgressLevel::PerformanceMilestones
+        }
+        ProgressLevel::EliteTier => registration_contract::ProgressLevel::EliteTier,
+    }
+}
+
 const INSTANCE_TTL_MIN: u32 = 100;
 const INSTANCE_TTL_MAX: u32 = 500;
 
@@ -26,6 +54,10 @@ const PERSISTENT_TTL_MAX: u32 = 518_400;
 // Admin key bumped conservatively; syncs with registration contract to ensure
 // cross-contract admin operations remain valid.
 const ADMIN_BUMP_LEDGERS: u32 = 518_400;
+
+// Bump applied to the admin key on every privileged call, so the admin address
+// cannot lapse out of persistent storage between privileged calls.
+const ADMIN_BUMP_LEDGERS: u32 = 100_000;
 
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HISTORY_PAGE_SIZE: u32 = 8;
@@ -107,6 +139,8 @@ impl ProgressContract {
         Ok(())
     }
 
+    /// Store the verification contract address allowed to call `advance_level`.
+    /// When set, only that contract may authorize level advances (admin only).
     /// Store the registration contract address so we can sync player levels (admin only).
     pub fn set_registration_contract(env: Env, addr: Address) -> Result<(), ProgressError> {
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
@@ -291,7 +325,7 @@ impl ProgressContract {
             .get::<DataKey, Address>(&DataKey::RegistrationContract)
         {
             let reg_client = registration_contract::Client::new(&env, &reg_contract);
-            match reg_client.try_set_player_level(&player_id, &target_level) {
+            match reg_client.try_set_player_level(&player_id, &to_imported_level(&target_level)) {
                 Ok(Ok(())) => {}
                 _ => return Err(ProgressError::RegistrationCallFailed),
             }
@@ -399,7 +433,7 @@ impl ProgressContract {
             .get::<DataKey, Address>(&DataKey::RegistrationContract)
         {
             let reg_client = registration_contract::Client::new(&env, &reg_contract);
-            match reg_client.try_set_player_level(&player_id, &new_level) {
+            match reg_client.try_set_player_level(&player_id, &to_imported_level(&new_level)) {
                 Ok(Ok(())) => {}
                 _ => return Err(ProgressError::RegistrationCallFailed),
             }
@@ -1721,6 +1755,17 @@ impl ProgressContract {
             return Err(ProgressError::ContractPaused);
         }
         Ok(())
+    }
+
+    fn require_admin(env: &Env) -> Result<Address, ProgressError> {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(ProgressError::NotInitialized)?;
+        admin.require_auth();
+        env.storage().persistent().extend_ttl(&DataKey::Admin, ADMIN_BUMP_LEDGERS, ADMIN_BUMP_LEDGERS);
+        Ok(admin)
     }
 }
 
@@ -3346,4 +3391,5 @@ mod tests {
             "expected HistoryEntryNotFound for out-of-range index"
         );
     }
+}
 }

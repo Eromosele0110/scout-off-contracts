@@ -5,6 +5,7 @@ mod types;
 
 use types::{FeeConfigProposal, ProContactPeriod, ScoutAccessWiringState};
 
+use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
 pub use errors::ScoutAccessError;
 pub use types::{
     ContactRecord, DataKey, EvidenceAccessGrant, FeeConfig, FeeConfigHistoryEntry,
@@ -124,6 +125,9 @@ const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 // to prevent race conditions / double-charging on rapid upgrades.
 const MIN_UPGRADE_INTERVAL_SECS: u64 = 3600;
 
+// Bump applied to the admin key on every privileged call, so the admin address
+// cannot lapse out of persistent storage between privileged calls.
+const ADMIN_BUMP_LEDGERS: u32 = 100_000;
 // #456: Minimum cooldown (seconds) between trial offers from the same scout
 // to the same player — enforces one pending offer per (scout, player) per day.
 const TRIAL_OFFER_COOLDOWN_SECS: u64 = 86_400; // 24 hours
@@ -6564,6 +6568,13 @@ mod tests {
         // view call (e.g. get_auto_renew) would clear the buffer.
         let events = env.events().all();
         assert_eq!(
+            contract_balance_before - refund_amount,
+            contract_balance_after
+        );
+        assert_eq!(
+            scout_balance_before + refund_amount,
+            scout_balance_after
+        );
             events,
             soroban_sdk::vec![
                 &env,

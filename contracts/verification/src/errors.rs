@@ -53,6 +53,11 @@ pub enum VerificationError {
     ProgressCallFailed = 12,
     /// Milestone counter overflowed.
     Overflow = 13,
+    MilestoneNotFound = 14,
+    ValidatorCapReached = 15,
+    /// A single validator has already approved
+    /// MAX_MILESTONES_PER_PLAYER_PER_VALIDATOR milestones for this player.
+    MilestoneLimitExceeded = 16,
 
     // ── Admin transfer ──
     /// `accept_admin` called before an admin transfer was proposed.
